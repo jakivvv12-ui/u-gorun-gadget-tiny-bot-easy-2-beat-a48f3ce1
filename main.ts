@@ -21,11 +21,14 @@
 
 import { BPS, runBars, type Bar, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
-const FAST = 6;
-const SLOW = 18;
-const MOM_BARS = 12;
+const FAST = 8;
+const SLOW = 24;
+const MOM_BARS = 24;
+const MOM_MIN = 0.015; // entry needs a real 24h move, not a bounce
+const GAP_MIN = 0.003; // EMA(8) at least 0.3% above EMA(24)
+const COOLDOWN_BARS = 12; // no re-entry for 12 bars after an exit
 const TOP_K = 4;
-const STOP_BPS = 600n; // exit at -6% versus cost
+const STOP_BPS = 500n; // exit at -5% versus cost
 const MAX_SLIPPAGE_BPS = 250;
 const MIN_ORDERS = 8;
 const MIN_ORDER_DEADLINE_BAR = 30;
@@ -39,6 +42,7 @@ interface Series {
 }
 
 const series = new Map<string, Series>();
+const lastExitBar = new Map<string, number>();
 let scoredBars = 0;
 let ordersSent = 0;
 
@@ -73,7 +77,7 @@ function inTrend(s: Series): boolean {
   const m = momentum(s);
   if (s.fast === null || s.slow === null || m === null) return false;
   const last = s.closes[s.closes.length - 1];
-  return s.fast > s.slow && last > s.slow && m > 0;
+  return s.fast > s.slow * (1 + GAP_MIN) && last > s.slow && m > MOM_MIN;
 }
 
 /** Exit-side trend break, with hysteresis: no momentum condition. */
@@ -102,6 +106,7 @@ await runBars({
       if (stopped || s === undefined || trendBroken(s)) {
         sells.push({ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
         stoppedOrBroken.add(symbol);
+        lastExitBar.set(symbol, scoredBars);
       }
     }
 
@@ -121,6 +126,8 @@ await runBars({
     for (const symbol of ranked) {
       if (orders.length >= caps.max_orders_per_bar || heldCount >= TOP_K) break;
       if (state.positions.has(symbol)) continue;
+      const exited = lastExitBar.get(symbol);
+      if (exited !== undefined && scoredBars - exited < COOLDOWN_BARS) continue;
       let slice = byWeight;
       if (cash < slice) slice = cash;
       if (slice === 0n || slice < BigInt(fees.min_notional_quote_units)) break;
