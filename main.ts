@@ -24,7 +24,8 @@ import { BPS, runBars, type Bar, type BuyInput, type SellInput } from './vendor/
 const FAST = 8;
 const SLOW = 24;
 const MOM_BARS = 24;
-const MOM_MIN = 0.015; // entry needs a real 24h move, not a bounce
+const MOM_MIN = 0.025; // entry needs a real 24h move, not a bounce
+const TRAIL = 0.04; // exit if close falls 4% from its peak since entry
 const GAP_MIN = 0.003; // EMA(8) at least 0.3% above EMA(24)
 const COOLDOWN_BARS = 12; // no re-entry for 12 bars after an exit
 const TOP_K = 4;
@@ -43,6 +44,7 @@ interface Series {
 
 const series = new Map<string, Series>();
 const lastExitBar = new Map<string, number>();
+const peakSinceEntry = new Map<string, number>();
 let scoredBars = 0;
 let ordersSent = 0;
 
@@ -103,7 +105,14 @@ await runBars({
       const s = series.get(symbol);
       const value = state.value(symbol, held.qty);
       const stopped = value * BPS <= held.cost * (BPS - STOP_BPS);
-      if (stopped || s === undefined || trendBroken(s)) {
+      let trailed = false;
+      if (s !== undefined) {
+        const last = s.closes[s.closes.length - 1];
+        const peak = Math.max(peakSinceEntry.get(symbol) ?? last, last);
+        peakSinceEntry.set(symbol, peak);
+        trailed = last < peak * (1 - TRAIL);
+      }
+      if (stopped || trailed || s === undefined || trendBroken(s)) {
         sells.push({ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
         stoppedOrBroken.add(symbol);
         lastExitBar.set(symbol, scoredBars);
@@ -134,6 +143,8 @@ await runBars({
       orders.push({ side: 'buy', symbol, notional_quote_units: slice, max_slippage_bps: MAX_SLIPPAGE_BPS });
       cash -= slice;
       heldCount++;
+      const s = series.get(symbol);
+      if (s !== undefined) peakSinceEntry.set(symbol, s.closes[s.closes.length - 1]);
     }
 
     // Trade-count floor: on a quiet window, rotate a small slice through the
