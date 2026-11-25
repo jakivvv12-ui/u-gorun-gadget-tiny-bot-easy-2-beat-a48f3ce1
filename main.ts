@@ -82,6 +82,14 @@ function inTrend(s: Series): boolean {
   return s.fast > s.slow * (1 + GAP_MIN) && last > s.slow && m > MOM_MIN;
 }
 
+/** Moderate trend: enough when the broad market agrees (see breadth below). */
+function moderateTrend(s: Series): boolean {
+  const m = momentum(s);
+  if (s.fast === null || s.slow === null || m === null) return false;
+  const last = s.closes[s.closes.length - 1];
+  return s.fast > s.slow && last > s.slow && m > 0;
+}
+
 /** Exit-side trend break, with hysteresis: no momentum condition. */
 function trendBroken(s: Series): boolean {
   if (s.fast === null || s.slow === null) return false;
@@ -121,23 +129,37 @@ await runBars({
 
     const orders: (SellInput | BuyInput)[] = sells.slice(0, caps.max_orders_per_bar);
 
+    // Market breadth: how many symbols have EMA(8) above EMA(24). A broad
+    // uptrend lets moderate trends in at half size; a lone bounce in a weak
+    // market does not.
+    let breadthCount = 0;
+    let breadthTotal = 0;
+    for (const { symbol } of state.hello.symbols) {
+      const s = series.get(symbol);
+      if (s !== undefined && s.fast !== null && s.slow !== null) {
+        breadthTotal++;
+        if (s.fast > s.slow) breadthCount++;
+      }
+    }
+    const broadUp = breadthTotal > 0 && breadthCount * 7 >= breadthTotal * 4;
+
     // Entries: fill any empty leader slot as soon as a symbol qualifies.
     const ranked = state.hello.symbols
       .map(({ symbol }) => ({ symbol, s: series.get(symbol) }))
-      .filter((x) => x.s !== undefined && inTrend(x.s))
+      .filter((x) => x.s !== undefined && (inTrend(x.s) || (broadUp && moderateTrend(x.s))))
       .sort((a, b) => (momentum(b.s!) ?? 0) - (momentum(a.s!) ?? 0))
       .slice(0, TOP_K)
-      .map((x) => x.symbol);
+      .map((x) => ({ symbol: x.symbol, strong: inTrend(x.s!) }));
 
     const byWeight = (BigInt(caps.max_weight_bps) * state.equity) / BPS;
     let cash = state.cash;
     let heldCount = state.positions.size - stoppedOrBroken.size;
-    for (const symbol of ranked) {
+    for (const { symbol, strong } of ranked) {
       if (orders.length >= caps.max_orders_per_bar || heldCount >= TOP_K) break;
       if (state.positions.has(symbol)) continue;
       const exited = lastExitBar.get(symbol);
       if (exited !== undefined && scoredBars - exited < COOLDOWN_BARS) continue;
-      let slice = byWeight;
+      let slice = strong ? byWeight : byWeight / 2n;
       if (cash < slice) slice = cash;
       if (slice === 0n || slice < BigInt(fees.min_notional_quote_units)) break;
       orders.push({ side: 'buy', symbol, notional_quote_units: slice, max_slippage_bps: MAX_SLIPPAGE_BPS });
